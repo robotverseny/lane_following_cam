@@ -7,192 +7,269 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from cv_bridge import CvBridge
 from rclpy.node import Node
 import rclpy
+from collections import deque
+from filterpy.kalman import KalmanFilter
+
+#runde:   ros2 launch lane_following_cam example_bag.launch.py brightness:=125 saturation:=10 multiplier_bottom:=0.8 multiplier_top:=0.65 divisor:=9.0 cam_align:=-50
+#f1tenth: ros2 launch lane_following_cam robot_compressed1.launch.py brightness:=-10 saturation:=10 multiplier_bottom:=1.0 multiplier_top:=0.65 divisor:=9.0
+#munchen: ros2 launch lane_following_cam robot_compressed1.launch.py brightness:=-10 saturation:=10 multiplier_bottom:=1.0 multiplier_top:=0.45 divisor:=5.0
+#jkk:     ros2 launch lane_following_cam robot_compressed1.launch.py multiplier_bottom:=1.0 multiplier_top:=0.65 divisor:=5.0 islane:=false
 
 class LaneDetect(Node):
     def __init__(self):
         super().__init__('lane_detect')
-        self.start()
-        self.setup_subscribers_and_publishers()
-        self.initialize_pid_parameters()
-        self.bridge = CvBridge()
-
-    def start(self):
+        # parameters
         self.declare_parameter('raw_image', False)
         self.declare_parameter('image_topic', '/image_raw')
         self.declare_parameter('debug', True)
-
-    def setup_subscribers_and_publishers(self):
+        self.declare_parameter('brightness', -10)
+        self.declare_parameter('multiplier_bottom', 1.0)
+        self.declare_parameter('multiplier_top', 0.45)
+        self.declare_parameter('divisor', 3.0)
+        self.declare_parameter('saturation', 10)
+        self.declare_parameter('cam_align', 0)
+        self.declare_parameter('islane', True)
+        
+        # Get parameter values
+        self.brightness = self.get_parameter('brightness').value
+        self.multiplier_bottom = self.get_parameter('multiplier_bottom').value
+        self.multiplier_top = self.get_parameter('multiplier_top').value
+        self.divisor = self.get_parameter('divisor').value
+        self.saturation = self.get_parameter('saturation').value
+        self.cam_align = self.get_parameter('cam_align').value
+        self.islane = self.get_parameter('islane').value
         img_topic = self.get_parameter('image_topic').value
         if self.get_parameter('raw_image').value:
             self.sub1 = self.create_subscription(Image, img_topic, self.raw_listener, 10)
+            self.sub1  # prevent unused variable warning
             self.get_logger().info(f'lane_detect subscribed to raw image topic: {img_topic}')
         else:
             self.sub2 = self.create_subscription(CompressedImage, '/image_raw/compressed', self.compr_listener, 10)
+            self.sub2  # prevent unused variable warning
             self.get_logger().info(f'lane_detect subscribed to compressed image topic: {img_topic}')
         self.pub1 = self.create_publisher(Image, '/lane_img', 10)
         self.pub2 = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.offset_pub = self.create_publisher(Float32, '/lane_center_offset', 10)
+        self.bridge = CvBridge()
+        self.debug = self.get_parameter('debug').value
+        # New publisher for lane center
+        self.center_pub = self.create_publisher(Float32, '/lane_center', 10)
 
-    def initialize_pid_parameters(self):
-        self.kp = 0.1
-        self.ki = 0.01
-        self.kd = 0.05
-        self.max_angle = 0.4  # Max steering angle in radians
-        self.speed_mps = 0.5  # Speed in meters per second
-        self.t_previous = self.get_clock().now()
-        self.e_previous = 0
-        self.P, self.I, self.D = 0, 0, 0
+        self.kf = KalmanFilter(dim_x=2, dim_z=1)        # 2 state variables (position, velocity)
+        self.kf.x = np.array([0, 0])                    # Initial state: [position, velocity]
+        self.kf.F = np.array([[1, 1], [0, 1]])          # State transition matrix
+        self.kf.H = np.array([[1, 0]])                  # Observation matrix
+        self.kf.P *= 1000                               # Large initial uncertainty
+        self.kf.R = 10                                  # Measurement noise (adjust for sensitivity). Higher value → less trust in measurements (smoother but slower)
+        self.kf.Q = np.array([[0.01, 0], [0, 0.5]])     # Process noise (adjust for sensitivity). Higher value → faster response but can be more unstable
+
+        # For extra center smoothing
+        self.center_history = deque(maxlen=3)           # Adjust smoothness
+
+        #Default values
+        self.width = 640
+        self.height = 480
 
     def raw_listener(self, msg):
+        # Convert ROS Image message to OpenCV image
         cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        # print info of the image, only once not every time
         self.get_logger().info(f'First raw img arrived, shape: {cv_image.shape}', once=True)
+        # Detect lanes
         lane_image = self.detect_lanes(cv_image)
+        # Convert OpenCV image to ROS Image message
         ros_image = self.bridge.cv2_to_imgmsg(lane_image, 'bgr8')
+        # Publish the image
         self.pub1.publish(ros_image)
     
     def compr_listener(self, msg):
+        # Convert ROS CompressedImage message to OpenCV image
         np_arr = np.frombuffer(msg.data, np.uint8)
         cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        # print info of the image, only once not every time
         self.get_logger().info(f'First compressed img arrived, shape: {cv_image.shape}', once=True)
+        # Detect lanes
         lane_image = self.detect_lanes(cv_image)
+        # Convert OpenCV image to ROS Image message
         ros_image = self.bridge.cv2_to_imgmsg(lane_image, 'bgr8')
+        # Publish the image
         self.pub1.publish(ros_image)
 
-    def detect_lanes(self, image):
-        imageBrighnessHigh = self.increase_brightness(image)
-        edges = self.apply_edge_detection(imageBrighnessHigh)
-        left_fitx, right_fitx, ploty, midpoint = self.sliding_window(edges)
-        center_deviation = self.calculate_center_deviation(left_fitx, right_fitx, midpoint)
-        self.publish_center_offset(center_deviation)
-        self.publish_twist_message(center_deviation)
-        return self.visualize_lanes(imageBrighnessHigh, left_fitx, right_fitx, ploty, center_deviation)
+    #Method to use, when dealing with lanes
+    def lane_img(self, image):
+        # Adjust brightness until lanes are visible
+        imageBrightness = cv2.convertScaleAbs(image, alpha=1, beta=self.brightness)
+        
+        hsv = cv2.cvtColor(imageBrightness, cv2.COLOR_BGR2HSV)       #hsv doesnt work on runde mcap
+        
+        # Recognise lanes based on color (white, yellow)
+        lower_white = np.array([0, 0, 200], dtype=np.uint8)
+        upper_white = np.array([180, self.saturation, 255], dtype=np.uint8)      #change saturation, so it only recognises lanes
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
 
-    def increase_brightness(self, image):
-        return cv2.convertScaleAbs(image, alpha=1, beta=10)
+        lower_yellow = np.array([20, 200, 100], dtype=np.uint8)
+        upper_yellow = np.array([30, 255, 255], dtype=np.uint8)
+        mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-    def apply_edge_detection(self, image):
+        mask = cv2.bitwise_or(mask_white, mask_yellow)
+        filtered_image = cv2.bitwise_and(image, image, mask=mask)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(filtered_image, cv2.COLOR_BGR2GRAY)
+        # Detect edges using Canny
+        edges = cv2.Canny(gray, 75, 150)
+        # Defining ROI
+        self.height, self.width = edges.shape
+        mask = np.zeros_like(edges)
+        
+        polygon = np.array([[
+            (0, int(self.height * self.multiplier_bottom)),          #runde: 0.8     other: 1    
+            (self.width, int(self.height * self.multiplier_bottom)),
+            (self.width, int(self.height * self.multiplier_top)),              #big_track_munchen_only_camera_a.mcap: 0.45 f1tenth: 0.6 runde: 0.65
+            (0, int(self.height * self.multiplier_top))
+        ]], np.int32)
+        cv2.fillPoly(mask, polygon, 255)
+        cropped_edges = cv2.bitwise_and(edges, mask)
+
+        return cropped_edges
+
+    def tube_img(self, image):
+        # Greyscale edge detection
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.convertScaleAbs(gray, alpha=1, beta=10) 
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        return cv2.Canny(gray, 100, 200)
+        gray = cv2.convertScaleAbs(gray, alpha=10, beta=20)
+        gray = cv2.GaussianBlur(gray, (15, 19), 0)
 
-    def sliding_window(self, edges):
-        window_height = 40
-        num_windows = 10
-        margin = 50
-        minpix = 50
+        edges = cv2.Canny(gray, 0, 50)
+        
+        # Defining ROI
+        self.height, self.width = edges.shape
+        mask = np.zeros_like(edges)
+        
+        polygon = np.array([[
+            (0, int(self.height * self.multiplier_bottom)),
+            (self.width, int(self.height * self.multiplier_bottom)),
+            (self.width, int(self.height * self.multiplier_top)),
+            (0, int(self.height * self.multiplier_top))
+        ]], np.int32)
+        cv2.fillPoly(mask, polygon, 255)
+        cropped_edges = cv2.bitwise_and(edges, mask)
 
-        histogram = np.sum(edges[edges.shape[0]//2:,:], axis=0)
-        midpoint = int(histogram.shape[0]//2)
-        leftx_base = np.argmax(histogram[:midpoint])
-        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+        # Post-process edges to close gaps and reduce noise
+        kernel = np.ones((3, 3), np.uint8)
+        final_edges = cv2.morphologyEx(cropped_edges, cv2.MORPH_CLOSE, kernel)
+        
+        return final_edges
 
-        nonzero = edges.nonzero()
-        nonzeroy = np.array(nonzero[0])
-        nonzerox = np.array(nonzero[1])
+    def detect_lanes(self, image): 
+        
+        # Check if the image is a tube image
+        # Detect lines using Hough transform
+        
+        if self.islane:
+            lines = cv2.HoughLinesP(self.lane_img(image), 1, np.pi / 180, 50, maxLineGap=50)
+        else:
+            lines = cv2.HoughLinesP(self.tube_img(image), 1, np.pi / 180, 50, maxLineGap=50)
 
-        leftx_current = leftx_base
-        rightx_current = rightx_base
-
-        left_lane_inds = []
-        right_lane_inds = []
-
-        for window in range(num_windows):
-            win_y_low = edges.shape[0] - (window + 1) * window_height
-            win_y_high = edges.shape[0] - window * window_height
-            win_xleft_low = leftx_current - margin
-            win_xleft_high = leftx_current + margin
-            win_xright_low = rightx_current - margin
-            win_xright_high = rightx_current + margin
-
-            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                              (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                               (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
-
-            left_lane_inds.append(good_left_inds)
-            right_lane_inds.append(good_right_inds)
-
-            if len(good_left_inds) > minpix:
-                leftx_current = int(np.mean(nonzerox[good_left_inds]))
-            if len(good_right_inds) > minpix:
-                rightx_current = int(np.mean(nonzerox[good_right_inds]))
-
-        left_lane_inds = np.concatenate(left_lane_inds)
-        right_lane_inds = np.concatenate(right_lane_inds)
-
-        leftx = nonzerox[left_lane_inds]
-        lefty = np.array(nonzero[0])
-        rightx = nonzerox[right_lane_inds]
-        righty = np.array(nonzero[0])
-
-        left_fit = np.polyfit(lefty, leftx, 2)
-        right_fit = np.polyfit(righty, rightx, 2)
-
-        ploty = np.linspace(0, edges.shape[0] - 1, edges.shape[0])
-        left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
-        right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
-
-        return left_fitx, right_fitx, ploty, midpoint
-
-    def calculate_center_deviation(self, left_fitx, right_fitx, midpoint):
-        center_fitx = (left_fitx + right_fitx) / 2
-        return center_fitx[-1] - midpoint
-
-    def publish_center_offset(self, center_deviation):
-        self.offset_pub.publish(Float32(data=center_deviation))
-
-    def publish_twist_message(self, center_deviation):
-        twist = Twist()
-        twist.linear.x = 0.2  # Constant forward speed
-        twist.angular.z = -0.01 * center_deviation  # Adjust angular speed based on deviation
-        self.pub2.publish(twist)
-
-    def visualize_lanes(self, image, left_fitx, right_fitx, ploty, center_deviation):
         line_image = np.zeros_like(image)
-        for i in range(len(ploty)):
-            cv2.circle(line_image, (int(left_fitx[i]), int(ploty[i])), 2, (255, 0, 0), -1)
-            cv2.circle(line_image, (int(right_fitx[i]), int(ploty[i])), 2, (0, 255, 0), -1)
-            cv2.circle(line_image, (int((left_fitx[i] + right_fitx[i]) / 2), int(ploty[i])), 2, (0, 0, 255), -1)
+        left_x = []
+        right_x = []
+
+        if (len(self.center_history) == 0) or (self.center_history[-1] in range(-self.width, 2 * self.width)):
+            check_center = self.width / 2                       #Initializing a default value for center if the deque is empty
+        else:
+            deque_center = np.mean(self.center_history)         #If not, we calculate a center using the last few cennters
+            
+            self.kf.predict()                                   #And we predict
+            self.kf.update(np.array([deque_center]))
+            check_center = self.kf.x[0]
+            
+
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                if length > 60:                                                     # Only accepting lines that measure over 60 px in length
+                    slope = (y2 - y1) / (x2 - x1) if x2 != x1 else np.inf
+                    if 0.1 < abs(slope) < 5.0:  # Filter based on slope
+                        cv2.line(line_image, (x1, y1), (x2, y2), (0, 0, 255), 5)
+                        if x1 < check_center and x2 < check_center:                 # If the turn is so steep, that it enters the other side of the screen, we account for it here
+                            if slope < 0.2:
+                                x1 += self.width/(2*self.divisor)
+                                x2 += self.width/(2*self.divisor)
+                            left_x.extend([x1, x2])
+                        elif x1 > check_center and x2 > check_center:
+                            if slope < 0.2:
+                                x1 -= self.width/(2*self.divisor)
+                                x2 -= self.width/(2*self.divisor)
+                            right_x.extend([x1, x2])
+
+        # Calculating the center
+        center = self.width / 2          # Default center
+
+        if left_x and right_x:
+            left_avg = np.mean(left_x)
+            right_avg = np.mean(right_x)
+            center = (left_avg + right_avg) / 2
+        elif left_x:
+            left_avg = np.mean(left_x)
+            center = (left_avg + self.width) / 2
+            center = center + ((self.width/self.divisor) * (5 * (1 - (self.divisor/10))) * (0.5 - (abs(center - left_avg)/self.width)))    # Adjust divisor to lane size
+        elif right_x:
+            right_avg = np.mean(right_x)
+            center = (right_avg - (self.width/self.divisor))/ 2
+            center = center - ((self.width/self.divisor) * (5 * (1 - (self.divisor/10))) * (0.5 - (abs(center - right_avg)/self.width)))   # Adjust divisor to lane size
+
+        # Averaging the last few measured centers
+        self.center_history.append(center)
+        deque_center = np.mean(self.center_history)
+
+        # Applying the Kalman filter
+        self.kf.predict()  # Prediction step
+        self.kf.update(np.array([deque_center]))        # Update with the new measurement
+        smoothed_center = self.kf.x[0]                  # Get the filtered (smoothed) center position
+
+        # Twist logic
+
+        twist = Twist()
+
+        if not left_x and not right_x:
+            # If there are no lines detected, slow the robot
+            twist.angular.z = 0.0
+            twist.linear.x = 0.05
+            self.pub2.publish(twist)
+        else:
+            twist.linear.x = 0.2
+            #   velocity (m/s)
+            twist.angular.z = -0.0025 * ((smoothed_center + self.cam_align) - (self.width/2))
+            #   angular velocity(rad/s)       turn left -> positive value, turn right -> negative value
+            self.pub2.publish(twist)
+
+        # Displaying center of lane using smoothed center
+        cv2.line(line_image, (int((smoothed_center)), self.height), (int((smoothed_center)), int(self.height * (self.multiplier_top + 0.1))), (255, 0, 0), 2)
+        cv2.circle(line_image, (int((smoothed_center)), int(self.height * self.multiplier_top)), 5, (255, 0, 0), -1)
+
+        # Display the twist.angular.z value on the image and direction (left or right or straight)
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        direction = 'Straight'
-        if center_deviation > 0.01:
-            direction = 'Right'
-        elif center_deviation < -0.01:
-            direction = 'Left'
-        cv2.putText(line_image, f'{direction} {abs(center_deviation):.2f}', (10, 30), font, 1, (60, 40, 200), 2, cv2.LINE_AA)
-
-        if self.debug:
-            return line_image
+        if twist.angular.z > 0.01:
+            text = 'Left'
+        elif twist.angular.z < -0.01:
+            text = 'Right'
         else:
-            return cv2.addWeighted(image, 0.8, line_image, 1, 1)
-
-    def pid_control(self, error):
-        t = self.get_clock().now()
-        dt = (t - self.t_previous).nanoseconds / 1e9
-        de = self.e_previous - error 
-        self.P = error
-        self.I = self.I + error * dt
-        self.D = de / dt if dt > 0 else 0
-        steer_rad = self.kp * self.P + self.ki * self.I + self.kd * self.D
+            text = 'Straight'
+        cv2.putText(line_image, f'{text} {abs(twist.angular.z):.2f}', (10, 30), font, 1, (60, 40, 200), 2, cv2.LINE_AA)
         
-        steer_rad = max(-self.max_angle, min(steer_rad, self.max_angle))
-        
-        self.t_previous = t
-        self.e_previous = error
+        # Combine the original image with the line image
+        if self.debug:
+            combined_image = cv2.addWeighted(image, 0.3, line_image, 1, 1)
+        else: 
+            combined_image = line_image
 
-        return steer_rad
+        # Publish the center as a Float32 message
+        center_msg = Float32()
+        center_msg.data = smoothed_center
+        self.center_pub.publish(center_msg)
 
-    def callback(self, data):
-        error = data.data
-        steer_rad = self.pid_control(error)
-
-        twist = Twist()
-        twist.linear.x = self.speed_mps
-        twist.angular.z = steer_rad
-
-        self.pub2.publish(twist)
+        return combined_image
 
 def main(args=None):
     rclpy.init(args=args)

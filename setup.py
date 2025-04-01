@@ -24,7 +24,6 @@ setup(
     entry_points={
         'console_scripts': [
             'lane_detect = lane_following_cam.lane_detect:main',
-            # 'param_find = lane_following_cam.param_find:main'
         ],
     },
 )

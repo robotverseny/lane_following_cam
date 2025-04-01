@@ -14,3 +14,6 @@ if ! screen -ls | grep -q "driver"; then
 else
     echo -e "\e[41merror\e[0m driver already started"
 fi
+chmod +x ~/ros2_ws/src/savtartas/shell/start_drivers.sh
+alias start_drivers='~/ros2_ws/src/savtartas/shell/start_drivers.sh'
+
