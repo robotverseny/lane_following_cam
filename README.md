@@ -4,6 +4,8 @@ Lane following based on camera as a ROS 2 python package.
 [![Static Badge](https://img.shields.io/badge/ROS_2-Humble-34aec5)](https://docs.ros.org/en/humble/)
 [![Static Badge](https://img.shields.io/badge/ROS_2-Jazzy-34aec5)](https://docs.ros.org/en/jazzy/)
 
+![img](resource/lane_follow01.png)
+
 ## Packages and build
 
 It is assumed that the workspace is `~/ros2_ws/`.
